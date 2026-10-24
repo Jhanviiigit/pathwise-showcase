@@ -20,7 +20,7 @@ PathWise is a multi-agent AI routing system built on Google's AI and Maps stack.
 - **Is this route beautiful right now?** (Gemini Vision scenic scoring with season, weather and golden-hour context)
 - **Is it safe for my vehicle in today's conditions?** (weather-aware risk scoring)
 
-The user enters a destination, a vehicle type, and a mode — **Touristy** or **Time Crunch**. An orchestrator built on Google ADK runs four specialist agents in parallel, and a Gemini fusion layer ranks the routes and explains the recommendation conversationally, like a tour guide.
+The user enters a destination, a vehicle type, and a mode — **Touristy** or **Time Crunch**. An orchestrator built on Google ADK runs four specialist agents in parallel, each producing a JSON output. A Gemini fusion layer reads all four, ranks the routes by mode, and narrates the recommendation conversationally, like a tour guide.
 
 ---
 
@@ -45,18 +45,24 @@ User request (vehicle · destination · Touristy / Time Crunch mode)
 PathWise Orchestrator — Google ADK · Vertex AI Agent Builder
         ↓ dispatches all routes to all agents simultaneously
 ┌─────────────────────────────────────────────────────────┐
-│ PHASE 1 — parallel filtering                            │
-│  Gully Detection Agent     → road width profile         │
-│  Vehicle Suitability Agent → vehicle profile            │
+│ PHASE 1 — parallel filtering (independent)              │
+│  Gully Detection Agent     → widths.json                │
+│  Vehicle Suitability Agent → vehicle_profile.json       │
 └─────────────────────────────────────────────────────────┘
         ↓
 ┌─────────────────────────────────────────────────────────┐
-│ PHASE 2 — parallel scoring                              │
-│  Scenic Route Agent        → scenic profile             │
-│  Vehicle Scoring Agent     → safety score               │
+│ PHASE 2 — parallel scoring (independent)                │
+│  Scenic Route Agent        → scenic_profile.json        │
+│  Vehicle Scoring Agent     → safety_score.json          │
 └─────────────────────────────────────────────────────────┘
         ↓
-Gemini Fusion Layer → ranked recommendation + narration
+Orchestrator aggregates all 4 JSONs
+        ↓
+Gemini Fusion Layer → final_recommendation.json
+        ↓
+Touristy (highest scenic index) | Time Crunch (shortest duration)
+        ↓
+Final recommendation + narration
 ```
 
 **Key design principle:** every agent is independent. No agent calls another directly — all communication goes through JSON contracts managed by the orchestrator, so any agent can be swapped, upgraded or scaled without touching the rest of the system.
@@ -66,26 +72,49 @@ Gemini Fusion Layer → ranked recommendation + narration
 ## The agents
 
 ### 🛣️ Gully Detection Agent — *how wide is this road, really?*
-Pulls satellite imagery at checkpoints along each route, builds a road graph, extracts the road centreline via skeletonization, and measures width in real-world metres using a distance transform.
-*OSMnx · OpenCV · scikit-image · Google Maps Tiles API*
+Fetches satellite imagery for ten checkpoints along each route, builds a road graph, extracts the road centreline via skeletonization, and measures width in real-world metres using a distance transform.
+
+*Maps Tiles API · OSMnx · OpenCV · skeletonization* → **`widths.json`** — segment-by-segment width profile per route
 
 ### 🚙 Vehicle Suitability Agent — *can this vehicle physically use this road?*
-Uses Gemini on Vertex AI to reason over measured road widths against vehicle dimensions, classifying each segment as **Passable**, **Caution** or **Not Passable**.
+Uses Gemini on Vertex AI to reason over measured road widths against vehicle dimensions, classifying every segment as **PASSABLE**, **CAUTION** or **NOT PASSABLE** for the specific vehicle type.
+
+*Vertex AI · Gemini* → **`vehicle_profile.json`**
 
 ### 🌄 Scenic Route Agent — *how beautiful is this route right now?*
-Samples Street View frames along the scenic section of each route and scores them with Gemini 2.5 Flash Vision. Scores are adjusted for context:
-- **Golden hour** boost near sunrise/sunset
-- **Season** weighting (monsoon favours greenery and water, winter favours open skies)
-- **Weather** (Ghat fog scores higher; heavy rain is penalised)
-- **Nearby landmarks** — waterfalls, viewpoints and forests from OpenStreetMap
+Samples five Street View frames from the scenic window of each route (skipping the urban start section). Each frame is classified by Gemini 2.5 Flash Vision for scenic quality, dominant scenery type and obstructions. The raw score is then adjusted by four contextual weights:
 
-It also raises road-risk flags (wet road, fog, flood-prone segments) for the safety agent.
+- **Golden hour** — 1.5× within 30 minutes of sunrise/sunset
+- **Season** — monsoon boosts water bodies and greenery; winter boosts open sky
+- **Weather** — fog in the Ghats scores 1.3×; heavy rain is penalised
+- **Nearby nature** — waterfalls, viewpoints and forests within 300 m add up to +0.30
+
+It also raises road-risk flags from weather data (wet road, fog risk, flood-prone segments) that the Vehicle Scoring Agent consumes via the orchestrator.
+
+*Street View Static API · Gemini 2.5 Flash Vision · Open-Meteo · OSM Overpass · Places API* → **`scenic_profile.json`**
 
 ### 🛡️ Vehicle Scoring Agent — *how risky is this route for this vehicle?*
-A FastAPI microservice that computes a 0–100 risk score from vehicle profile, road widths and weather flags, and decides whether each route is safe for each mode.
+A FastAPI microservice that computes a 0–100 risk score from the vehicle profile, road widths and weather flags, with bottleneck analysis. It sets two explicit flags per route — safe for Touristy mode and safe for Time Crunch mode — which gate the final recommendation.
+
+*FastAPI* → **`safety_score.json`**
 
 ### 🧠 Gemini Fusion Layer
-Combines all agent outputs with the user's chosen mode — ranking by scenic index (Touristy) or duration (Time Crunch), gated by the safety flags — and narrates the final recommendation in plain language.
+Reads all four agent outputs plus the user's chosen mode, ranks the routes, and blocks any route that fails the safety gate for that mode.
+
+It then narrates the result with a **PathWise tour-guide personality** — translating raw scores into human terms, describing what the driver will see, flagging risks plainly, and ending with a clear best bet.
+
+*Gemini · Vertex AI* → **`final_recommendation.json`**
+
+---
+
+## Routing modes
+
+| Mode | Optimises for | Safety gate |
+|------|---------------|-------------|
+| **Touristy** | Highest scenic index | Route must be safe for Touristy mode |
+| **Time Crunch** | Shortest duration | Route must be safe for Time Crunch mode |
+
+In Time Crunch mode, scenic scoring is skipped entirely to reduce latency.
 
 ---
 
@@ -93,11 +122,11 @@ Combines all agent outputs with the user's chosen mode — ranking by scenic ind
 
 - **AI & Agents:** Google ADK · Vertex AI Agent Builder · Gemini 2.5 Flash (text + vision)
 - **Maps:** Routes API · Maps Tiles API · Street View Static API · Places API (New) · Roads API
-- **Computer vision:** OpenCV · OSMnx · scikit-image
+- **Computer vision:** OpenCV · OSMnx · skeletonization
 - **Backend:** Python · FastAPI
 - **Frontend:** React · TypeScript · Vite · Tailwind CSS
 - **Infra:** Google Cloud Run · Google Cloud Storage
-- **Open data:** Open-Meteo (weather) · OpenStreetMap Overpass
+- **Open data:** Open-Meteo (weather) · OpenStreetMap Overpass (nature tags)
 
 ---
 
